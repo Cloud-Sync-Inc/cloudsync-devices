@@ -1,5 +1,5 @@
 #!/bin/bash
-# CloudSync Raspberry Pi Kiosk Setup Script v3.4
+# CloudSync Raspberry Pi Kiosk Setup Script v3.5
 # Works on Raspberry Pi OS 64-bit (desktop) and 32-bit Legacy.
 # Identical script for every clinic deployment.
 # Safe to run more than once on the same Pi. Works under any username.
@@ -11,6 +11,8 @@
 # Without arguments it sets everything up but leaves the token
 # alone and does not reboot.
 #
+# v3.5: hardware watchdog handed to systemd (the separate
+#       watchdog program could not open the device on new OS)
 # v3.4: wrapped in main() so a partial download never runs half a
 #       script; refuses to run as root; finds the boot folder on any
 #       image; Pi-safe watchdog timeout; cron watchdog can reach X
@@ -43,7 +45,7 @@ else
     BOOTDIR=/boot
 fi
 
-echo "=== CloudSync Kiosk Setup v3.4 Starting ==="
+echo "=== CloudSync Kiosk Setup v3.5 Starting ==="
 echo "User: $(whoami)   Home: $HOME   Arch: $(uname -m)   Boot: $BOOTDIR"
 echo ""
 
@@ -60,7 +62,7 @@ trap 'kill $SUDO_KEEPALIVE 2>/dev/null' EXIT
 # =============================================
 echo "Updating package lists..."
 sudo apt update
-sudo apt install -y cron unclutter xdotool watchdog
+sudo apt install -y cron unclutter xdotool
 
 # =============================================
 # STEP 1 -- Create config file
@@ -205,26 +207,18 @@ X-GNOME-Autostart-enabled=true
 EOF
 
 # =============================================
-# STEP 9 -- Hardware watchdog (guarded)
+# STEP 9 -- Hardware watchdog (handled by systemd)
+# systemd drives the Pi's hardware watchdog directly. The old
+# separate "watchdog" program fights it for the device, so it
+# is switched off if present and systemd's timer is set to 15s.
 # =============================================
 echo "Setting up hardware watchdog..."
-sudo modprobe bcm2835_wdt
-if grep -q "^bcm2835_wdt" /etc/modules; then
-    echo "bcm2835_wdt already in /etc/modules, skipping"
-else
-    echo "bcm2835_wdt" | sudo tee -a /etc/modules
+sudo mkdir -p /etc/systemd/system.conf.d
+printf '[Manager]\nRuntimeWatchdogSec=15\n' | sudo tee /etc/systemd/system.conf.d/cloudsync-watchdog.conf > /dev/null
+if systemctl list-unit-files watchdog.service > /dev/null 2>&1; then
+    sudo systemctl disable --now watchdog 2>/dev/null
 fi
-sudo sed -i 's/^#watchdog-device/watchdog-device/' /etc/watchdog.conf
-sudo sed -i 's/^#max-load-1/max-load-1/' /etc/watchdog.conf
-# The Pi's hardware watchdog maxes out around 15 seconds; the
-# default of 60 makes the daemon fail to set its timeout
-if grep -q "^watchdog-timeout" /etc/watchdog.conf; then
-    sudo sed -i 's/^watchdog-timeout.*/watchdog-timeout = 15/' /etc/watchdog.conf
-else
-    echo "watchdog-timeout = 15" | sudo tee -a /etc/watchdog.conf
-fi
-sudo systemctl enable watchdog
-sudo systemctl restart watchdog
+sudo systemctl daemon-reexec
 
 # =============================================
 # STEP 10 -- Persistent journal logging (guarded)
@@ -361,8 +355,8 @@ echo ""
 echo "--- Root Cron Jobs (expect ONE shutdown line) ---"
 sudo crontab -l
 echo ""
-echo "--- Watchdog Service ---"
-sudo systemctl is-active watchdog
+echo "--- Hardware Watchdog (expect 15s) ---"
+systemctl show -p RuntimeWatchdogUSec
 echo ""
 echo "--- HDMI Config (expect ONE block) ---"
 grep -n hdmi "$BOOTDIR"/config.txt
