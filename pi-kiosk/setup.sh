@@ -1,5 +1,5 @@
 #!/bin/bash
-# CloudSync Raspberry Pi Kiosk Setup Script v3.5
+# CloudSync Raspberry Pi Kiosk Setup Script v3.6
 # Works on Raspberry Pi OS 64-bit (desktop) and 32-bit Legacy.
 # Identical script for every clinic deployment.
 # Safe to run more than once on the same Pi. Works under any username.
@@ -11,6 +11,8 @@
 # Without arguments it sets everything up but leaves the token
 # alone and does not reboot.
 #
+# v3.6: staff message strip along the bottom, 100 messages,
+#       5 minute rotation picked from the clock
 # v3.5: hardware watchdog handed to systemd (the separate
 #       watchdog program could not open the device on new OS)
 # v3.4: wrapped in main() so a partial download never runs half a
@@ -45,7 +47,7 @@ else
     BOOTDIR=/boot
 fi
 
-echo "=== CloudSync Kiosk Setup v3.5 Starting ==="
+echo "=== CloudSync Kiosk Setup v3.6 Starting ==="
 echo "User: $(whoami)   Home: $HOME   Arch: $(uname -m)   Boot: $BOOTDIR"
 echo ""
 
@@ -115,7 +117,8 @@ else
     BROWSER=chromium
 fi
 
-URL="https://go.mycloudsync.app/kiosk/room-board/${TOKEN}"
+# Local page: board on top, staff message strip on the bottom
+URL="file://__HOME__/kiosk/kiosk.html?t=${TOKEN}"
 
 echo "$(date): Launching $BROWSER with token ${TOKEN:0:8}..." >> "$LOG"
 
@@ -130,6 +133,176 @@ DISPLAY=:0 $BROWSER \
     "${URL}" &
 EOF
 chmod +x "$HOME/launch-kiosk.sh"
+
+# =============================================
+# STEP 2b -- Message strip page and staff messages
+# The kiosk opens a local page: room board on top, a strip of
+# rotating staff messages along the bottom. Re-running this
+# script rewrites both files from the copies below.
+# =============================================
+echo "Creating message strip page..."
+mkdir -p "$HOME/kiosk"
+cat > "$HOME/kiosk/kiosk.html" << 'KIOSKHTML'
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden}
+body{display:flex;flex-direction:column}
+iframe{flex:1;border:0;width:100%}
+#strip{height:8vh;display:flex;align-items:center;justify-content:center;
+  background:#0f172a;color:#fff;font:600 3.4vh/1.2 system-ui,sans-serif;
+  text-align:center;padding:0 3vw;transition:opacity .8s}
+#strip.hide{opacity:0}
+</style></head><body>
+<iframe id="board"></iframe>
+<div id="strip"></div>
+<script>
+var t = new URLSearchParams(location.search).get('t') || '';
+document.getElementById('board').src = 'https://go.mycloudsync.app/kiosk/room-board/' + t;
+var strip = document.getElementById('strip'), shown = null;
+function load(cb){
+  var s = document.createElement('script');
+  s.src = 'messages.js?' + Date.now();
+  s.onload = s.onerror = function(){ s.remove(); cb(); };
+  document.head.appendChild(s);
+}
+// The message is picked from the clock, not a counter, so a reboot
+// never restarts the list and every Pi shows the same message.
+function tick(){
+  load(function(){
+    var m = window.KIOSK_MESSAGES || [];
+    var period = (window.KIOSK_ROTATE_MINUTES || 5) * 60000;
+    var now = Date.now();
+    if (!m.length) {
+      strip.style.display = 'none';
+    } else {
+      strip.style.display = 'flex';
+      var text = m[Math.floor(now / period) % m.length];
+      if (text !== shown) {
+        shown = text;
+        strip.classList.add('hide');
+        setTimeout(function(){
+          strip.textContent = text;
+          strip.classList.remove('hide');
+        }, 800);
+      }
+    }
+    setTimeout(tick, period - (now % period) + 500);
+  });
+}
+tick();
+</script>
+</body></html>
+KIOSKHTML
+
+echo "Writing staff messages..."
+cat > "$HOME/kiosk/messages.js" << 'KIOSKMSGS'
+// CloudSync staff messages. Edit freely; changes show at the next rotation.
+// Themes are interleaved so the same kind of message doesn't repeat back to back.
+window.KIOSK_MESSAGES = [
+  "Treat every patient like a loved one",
+  "Smooth is fast",
+  "We win or lose as a team",
+  "Say it clearly the first time",
+  "Details are the job",
+  "Breathe. Then go.",
+  "What we do matters to this town",
+  "Every patient is someone's whole world",
+  "Room the next patient before you're asked",
+  "If you see it, own it",
+  "Close the loop",
+  "Double-check meds. Every time.",
+  "Busy is not the same as productive",
+  "This clinic is the community's front door to care",
+  "Make eye contact. Use their name.",
+  "An empty room is a waiting patient",
+  "Ask for help early, not late",
+  "If it isn't written down, it didn't happen",
+  "Right patient. Right chart. Every time.",
+  "One patient at a time",
+  "You make this place work",
+  "A warm hello changes the whole visit",
+  "Check out right away. The board depends on it.",
+  "Offer help before you're asked",
+  "Over-communicate when it's busy",
+  "Do the little things right",
+  "Stay calm. Stay kind. Stay fast.",
+  "Healthy patients, healthy community",
+  "Patients remember how you made them feel",
+  "Finish what you start before starting something new",
+  "Nobody here works alone",
+  "Questions are free. Mistakes aren't.",
+  "Excellence is a habit, not an event",
+  "You set the tone for the room",
+  "Thank you for showing up today",
+  "Nobody chooses to be sick. Be kind.",
+  "Clean room, ready room",
+  "Your teammate's rush is your rush",
+  "Speak up if something feels off",
+  "Own your mistakes. Fix them fast.",
+  "Hard days build strong teams",
+  "Listen to understand, not to reply",
+  "Every minute in the waiting room counts",
+  "Thank someone today",
+  "Clear is kind",
+  "Good enough rarely is",
+  "Calm is contagious",
+  "The waiting room is part of the visit",
+  "Small delays add up. Fix them early.",
+  "Assume good intent",
+  "Tell the patient how long, then beat it",
+  "Be proud of the work you hand off",
+  "Solve the problem, not the blame",
+  "Explain it like you'd want it explained to you",
+  "Prep now saves panic later",
+  "A good handoff is a gift to the next person",
+  "No surprises for patients or teammates",
+  "Consistency builds trust",
+  "Progress over perfection",
+  "A two-minute update beats a twenty-minute silence",
+  "Know your next move before you finish this one",
+  "Back each other up",
+  "Repeat it back to get it right",
+  "Do it right when no one is watching",
+  "Bring your best to every room",
+  "Small kindness, big difference",
+  "Flow beats hustle",
+  "Celebrate the small wins",
+  "Every task is part of a patient's experience",
+  "Patience is part of patient care",
+  "Every complaint is a chance to win someone back",
+  "Fast feels rushed. Smooth feels cared for.",
+  "Leave it better than you found it",
+  "Standards are what we do on busy days",
+  "Today is a fresh start",
+  "Assume the patient is scared, not difficult",
+  "If it's on the board, it's real",
+  "Make your teammate look good",
+  "Follow up like you said you would",
+  "Be the calm in the chaos",
+  "Ask: is there anything else I can do for you today?",
+  "Keep the board honest",
+  "One team, one board",
+  "Better every day",
+  "Grace under pressure",
+  "Walk them out like a guest",
+  "Stock the room before you need it",
+  "Hand off like it matters, because it does",
+  "Pride in the details",
+  "Energy is a choice",
+  "Comfort first. Paperwork second.",
+  "Done right beats done twice",
+  "Be the reason someone's bad day got better",
+  "Look at the board. Who's been waiting longest?",
+  "Patients trust us with their worst days",
+  "Quiet moment? Get ahead.",
+  "Never let a patient wonder what happens next",
+  "Don't let the next patient wait on this one's paperwork",
+  "Greet everyone who walks in",
+  "A strong morning makes a smooth afternoon"
+];
+window.KIOSK_ROTATE_MINUTES = 5;
+KIOSKMSGS
 
 # =============================================
 # STEP 3 -- Boot to desktop automatically
@@ -294,6 +467,9 @@ cat > "$HOME/update-clinic.sh" << 'EOF'
 #   .88 = 10 rooms
 #   1.1 = 7 rooms
 #   1.4 = 5 rooms
+#
+# The message strip takes ~8% of the screen, so a clinic needs
+# about one step smaller with it on (Humboldt: 1.0 without, 0.9 with)
 
 CONFIG="__HOME__/cloudsync-kiosk.conf"
 
@@ -342,6 +518,9 @@ echo "=== Setup Complete ==="
 echo ""
 echo "--- Files in home ---"
 ls -la "$HOME" | grep -E 'clinic|kiosk|watchdog'
+echo ""
+echo "--- Message Strip (expect kiosk.html and messages.js) ---"
+ls -la "$HOME/kiosk"
 echo ""
 echo "--- Config File ---"
 cat "$HOME/cloudsync-kiosk.conf"
