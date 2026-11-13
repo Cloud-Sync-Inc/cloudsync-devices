@@ -4,15 +4,24 @@
 # Identical script for every clinic deployment.
 # Safe to run more than once on the same Pi. Works under any username.
 #
-# One-command install (sets token, zoom, then reboots):
+# One-command install (sets token, zoom, locks read-only, then reboots):
 #   curl -fsSL <SCRIPT_URL> | bash -s -- TOKEN ZOOM
 # Or from a local copy:
 #   bash cloudsync-pi-setup.sh TOKEN ZOOM
 # Without arguments it sets everything up but leaves the token
-# alone and does not reboot.
+# alone, does not lock, and does not reboot.
 #
-# v3.7: automatic OS updates turned off; journal kept in RAM only
-#       (no SD card writes); watchdog log only records restarts
+# READ-ONLY MODE: once locked, nothing is written to the SD card.
+# Anything saved on the Pi is lost at reboot. To change a token,
+# zoom, or staff messages:
+#   1) bash ~/kiosk-unlock.sh               (reboots)
+#   2) bash ~/update-clinic.sh TOKEN ZOOM   (or edit ~/kiosk/messages.js)
+#   3) bash ~/kiosk-lock.sh                 (reboots)
+#
+# v3.7: read-only SD card (overlay) with kiosk-lock / kiosk-unlock
+#       helpers; automatic OS updates off; journal in RAM only;
+#       Chromium cache capped at 50MB; watchdog log only records
+#       restarts; hardware watchdog relaxed to 60s; power check
 # v3.6: staff message strip along the bottom, 100 messages,
 #       5 minute rotation picked from the clock
 # v3.5: hardware watchdog handed to systemd (the separate
@@ -42,6 +51,14 @@ if [ "$(id -u)" -eq 0 ]; then
     exit 1
 fi
 
+# Running setup while locked would look like it worked, then
+# lose everything at the next reboot.
+if [ "$(findmnt -n -o FSTYPE /)" = "overlay" ]; then
+    echo "This Pi is in read-only mode. Changes would be lost at reboot."
+    echo "Run: bash ~/kiosk-unlock.sh   then run this script again."
+    exit 1
+fi
+
 # Newer images use /boot/firmware, older ones use /boot
 if [ -f /boot/firmware/config.txt ]; then
     BOOTDIR=/boot/firmware
@@ -67,6 +84,9 @@ trap 'kill $SUDO_KEEPALIVE 2>/dev/null' EXIT
 echo "Updating package lists..."
 sudo apt update
 sudo apt install -y cron unclutter xdotool
+# Read-only mode support. Newer images need this package; older
+# Legacy images handle it inside raspi-config instead.
+sudo apt install -y overlayroot 2>/dev/null || echo "overlayroot package not available, raspi-config will handle read-only mode"
 
 # =============================================
 # STEP 0b -- No automatic OS updates
@@ -95,7 +115,7 @@ else
     cat > "$HOME/cloudsync-kiosk.conf" << 'EOF'
 # CloudSync Kiosk Configuration
 # Set with: bash ~/update-clinic.sh TOKEN ZOOM
-# After editing run: sudo reboot
+# After editing run: bash ~/kiosk-lock.sh
 
 TOKEN=UNCONFIGURED
 ZOOM=1.5
@@ -105,6 +125,8 @@ fi
 
 # =============================================
 # STEP 2 -- Create kiosk launcher script
+# Cache is capped at 50MB. In read-only mode Chromium's cache
+# lives in RAM, so an uncapped cache would slowly eat memory.
 # =============================================
 echo "Creating kiosk launcher script..."
 cat > "$HOME/launch-kiosk.sh" << 'EOF'
@@ -145,6 +167,7 @@ DISPLAY=:0 $BROWSER \
     --no-first-run \
     --ozone-platform=x11 \
     --password-store=basic \
+    --disk-cache-size=52428800 \
     --force-device-scale-factor=${ZOOM} \
     "${URL}" &
 EOF
@@ -214,6 +237,7 @@ KIOSKHTML
 echo "Writing staff messages..."
 cat > "$HOME/kiosk/messages.js" << 'KIOSKMSGS'
 // CloudSync staff messages. Edit freely; changes show at the next rotation.
+// In read-only mode, run ~/kiosk-unlock.sh first or your edits are lost at reboot.
 // Themes are interleaved so the same kind of message doesn't repeat back to back.
 window.KIOSK_MESSAGES = [
   "Treat every patient like a loved one",
@@ -399,11 +423,12 @@ EOF
 # STEP 9 -- Hardware watchdog (handled by systemd)
 # systemd drives the Pi's hardware watchdog directly. The old
 # separate "watchdog" program fights it for the device, so it
-# is switched off if present and systemd's timer is set to 15s.
+# is switched off if present. 60s gives a slow Pi 3B+ room to
+# get through heavy moments without a needless hard reset.
 # =============================================
 echo "Setting up hardware watchdog..."
 sudo mkdir -p /etc/systemd/system.conf.d
-printf '[Manager]\nRuntimeWatchdogSec=15\n' | sudo tee /etc/systemd/system.conf.d/cloudsync-watchdog.conf > /dev/null
+printf '[Manager]\nRuntimeWatchdogSec=60\n' | sudo tee /etc/systemd/system.conf.d/cloudsync-watchdog.conf > /dev/null
 if systemctl list-unit-files watchdog.service > /dev/null 2>&1; then
     sudo systemctl disable --now watchdog 2>/dev/null
 fi
@@ -487,6 +512,14 @@ cat > "$HOME/update-clinic.sh" << 'EOF'
 
 CONFIG="__HOME__/cloudsync-kiosk.conf"
 
+if [ "$(findmnt -n -o FSTYPE /)" = "overlay" ]; then
+    echo "This Pi is in read-only mode. A change made now would be lost at reboot."
+    echo "  1) bash ~/kiosk-unlock.sh               (reboots)"
+    echo "  2) bash ~/update-clinic.sh TOKEN ZOOM"
+    echo "  3) bash ~/kiosk-lock.sh                 (reboots)"
+    exit 1
+fi
+
 if [ -z "${1:-}" ]; then
     echo "Usage: bash update-clinic.sh TOKEN ZOOM"
     echo "Example: bash update-clinic.sh myTokenHere .88"
@@ -510,9 +543,55 @@ CONF
 echo "Config updated:"
 cat "$CONFIG"
 echo ""
-echo "Reboot to apply: sudo reboot"
+echo "Next: bash ~/kiosk-lock.sh   (locks read-only and reboots)"
 EOF
 chmod +x "$HOME/update-clinic.sh"
+
+# =============================================
+# STEP 14b -- Read-only lock / unlock helpers
+# Locked: the SD card is read-only and every write goes to RAM,
+# so power loss, hard resets and card wear stop mattering.
+# Both helpers reboot, because the switch takes effect at boot.
+# =============================================
+echo "Creating read-only lock and unlock helpers..."
+cat > "$HOME/kiosk-lock.sh" << 'EOF'
+#!/bin/bash
+# Turns read-only mode ON, then reboots.
+if [ "$(findmnt -n -o FSTYPE /)" = "overlay" ]; then
+    echo "Already locked (read-only)."
+    exit 0
+fi
+echo "Turning on read-only mode (this can take a minute)..."
+if ! sudo raspi-config nonint do_overlayfs 0; then
+    echo "Could not turn on read-only mode. Not rebooting."
+    exit 1
+fi
+sudo raspi-config nonint enable_bootro 2>/dev/null || echo "Boot partition left writable on this OS version."
+echo "Locked. Rebooting in 10 seconds (Ctrl+C to cancel)..."
+sleep 10
+sudo reboot
+EOF
+chmod +x "$HOME/kiosk-lock.sh"
+
+cat > "$HOME/kiosk-unlock.sh" << 'EOF'
+#!/bin/bash
+# Turns read-only mode OFF, then reboots so changes can be saved.
+if [ "$(findmnt -n -o FSTYPE /)" != "overlay" ]; then
+    echo "Already unlocked. Make your changes, then run: bash ~/kiosk-lock.sh"
+    exit 0
+fi
+echo "Turning off read-only mode..."
+sudo raspi-config nonint disable_bootro 2>/dev/null
+if ! sudo raspi-config nonint do_overlayfs 1; then
+    echo "Could not turn off read-only mode. Not rebooting."
+    exit 1
+fi
+echo "Unlocked. After the reboot, make your changes, then run: bash ~/kiosk-lock.sh"
+echo "Rebooting in 10 seconds (Ctrl+C to cancel)..."
+sleep 10
+sudo reboot
+EOF
+chmod +x "$HOME/kiosk-unlock.sh"
 
 # =============================================
 # STEP 15 -- Resolve the __HOME__ placeholder
@@ -548,7 +627,7 @@ echo ""
 echo "--- Root Cron Jobs (expect ONE shutdown line) ---"
 sudo crontab -l
 echo ""
-echo "--- Hardware Watchdog (expect 15s) ---"
+echo "--- Hardware Watchdog (expect 1min) ---"
 systemctl show -p RuntimeWatchdogUSec
 echo ""
 echo "--- Auto Updates (expect masked or disabled) ---"
@@ -563,18 +642,30 @@ echo ""
 echo "--- cmdline.txt (expect ONE video= entry, single line) ---"
 cat "$BOOTDIR"/cmdline.txt
 echo ""
+echo "--- Power (expect throttled=0x0) ---"
+if command -v vcgencmd > /dev/null; then
+    THROTTLED=$(vcgencmd get_throttled)
+    echo "$THROTTLED"
+    if [ "$THROTTLED" != "throttled=0x0" ]; then
+        echo "!!! WARNING: this Pi has had low power since boot."
+        echo "!!! Use an official 5V 2.5A Pi power supply, not a TV USB port."
+        echo "!!! Low power corrupts SD cards."
+    fi
+else
+    echo "vcgencmd not found, could not check power"
+fi
+echo ""
 if [ -n "$ARG_TOKEN" ]; then
     echo "Setting clinic token..."
     bash "$HOME/update-clinic.sh" "$ARG_TOKEN" "$ARG_ZOOM"
     echo ""
-    echo "Rebooting in 10 seconds (Ctrl+C to cancel)..."
-    sleep 10
-    sudo reboot
+    # Locks read-only and reboots
+    bash "$HOME/kiosk-lock.sh"
 else
     echo "================================================"
-    echo "NEXT: set the clinic token"
+    echo "NEXT: set the clinic token, then lock and reboot"
     echo "  bash ~/update-clinic.sh YOUR_TOKEN_HERE .88"
-    echo "  sudo reboot"
+    echo "  bash ~/kiosk-lock.sh"
     echo "================================================"
 fi
 
