@@ -1,5 +1,5 @@
 #!/bin/bash
-# CloudSync Raspberry Pi Kiosk Setup Script v3.6
+# CloudSync Raspberry Pi Kiosk Setup Script v3.7
 # Works on Raspberry Pi OS 64-bit (desktop) and 32-bit Legacy.
 # Identical script for every clinic deployment.
 # Safe to run more than once on the same Pi. Works under any username.
@@ -11,6 +11,8 @@
 # Without arguments it sets everything up but leaves the token
 # alone and does not reboot.
 #
+# v3.7: automatic OS updates turned off; journal kept in RAM only
+#       (no SD card writes); watchdog log only records restarts
 # v3.6: staff message strip along the bottom, 100 messages,
 #       5 minute rotation picked from the clock
 # v3.5: hardware watchdog handed to systemd (the separate
@@ -47,7 +49,7 @@ else
     BOOTDIR=/boot
 fi
 
-echo "=== CloudSync Kiosk Setup v3.6 Starting ==="
+echo "=== CloudSync Kiosk Setup v3.7 Starting ==="
 echo "User: $(whoami)   Home: $HOME   Arch: $(uname -m)   Boot: $BOOTDIR"
 echo ""
 
@@ -65,6 +67,20 @@ trap 'kill $SUDO_KEEPALIVE 2>/dev/null' EXIT
 echo "Updating package lists..."
 sudo apt update
 sudo apt install -y cron unclutter xdotool
+
+# =============================================
+# STEP 0b -- No automatic OS updates
+# Kiosks get updated on purpose, one Pi at a time,
+# never on their own. Manual apt still works.
+# =============================================
+echo "Disabling automatic updates..."
+sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null
+sudo systemctl mask apt-daily.service apt-daily-upgrade.service 2>/dev/null
+if dpkg -s unattended-upgrades > /dev/null 2>&1; then
+    sudo apt purge -y unattended-upgrades
+fi
+printf 'APT::Periodic::Update-Package-Lists "0";\nAPT::Periodic::Unattended-Upgrade "0";\n' \
+    | sudo tee /etc/apt/apt.conf.d/99cloudsync-no-auto-updates > /dev/null
 
 # =============================================
 # STEP 1 -- Create config file
@@ -394,20 +410,20 @@ fi
 sudo systemctl daemon-reexec
 
 # =============================================
-# STEP 10 -- Persistent journal logging (guarded)
+# STEP 10 -- Journal in RAM only (saves SD card wear)
+# Also undoes persistent logging on Pis set up with
+# older versions of this script.
 # =============================================
-echo "Enabling persistent journal logging..."
-sudo mkdir -p /var/log/journal
-sudo systemd-tmpfiles --create --prefix /var/log/journal
-if grep -q "^Storage=persistent" /etc/systemd/journald.conf; then
-    echo "Journal persistence already set, skipping"
-else
-    echo "Storage=persistent" | sudo tee -a /etc/systemd/journald.conf
-fi
+echo "Setting journal to RAM only..."
+sudo sed -i '/^Storage=persistent/d' /etc/systemd/journald.conf
+sudo mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nStorage=volatile\nRuntimeMaxUse=30M\n' | sudo tee /etc/systemd/journald.conf.d/cloudsync.conf > /dev/null
+sudo rm -rf /var/log/journal
 sudo systemctl restart systemd-journald
 
 # =============================================
 # STEP 11 -- Chromium watchdog script
+# Only writes to the log when it actually restarts Chromium.
 # =============================================
 echo "Creating Chromium watchdog script..."
 cat > "$HOME/chromium-watchdog.sh" << 'EOF'
@@ -419,9 +435,7 @@ export XAUTHORITY="__HOME__/.Xauthority"
 LOG="__HOME__/watchdog.log"
 
 # Match the actual kiosk process, not this script's own command line
-if pgrep -f "chromium.*--kiosk" > /dev/null; then
-    echo "$(date): Chromium OK" >> "$LOG"
-else
+if ! pgrep -f "chromium.*--kiosk" > /dev/null; then
     echo "$(date): Chromium not running -- restarting" >> "$LOG"
     pkill -f "chromium.*--kiosk" 2>/dev/null
     sleep 2
@@ -536,6 +550,12 @@ sudo crontab -l
 echo ""
 echo "--- Hardware Watchdog (expect 15s) ---"
 systemctl show -p RuntimeWatchdogUSec
+echo ""
+echo "--- Auto Updates (expect masked or disabled) ---"
+systemctl is-enabled apt-daily-upgrade.timer apt-daily.timer 2>/dev/null
+echo ""
+echo "--- Journal (expect Storage=volatile) ---"
+cat /etc/systemd/journald.conf.d/cloudsync.conf
 echo ""
 echo "--- HDMI Config (expect ONE block) ---"
 grep -n hdmi "$BOOTDIR"/config.txt
